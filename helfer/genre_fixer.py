@@ -1,127 +1,53 @@
 # helfer/genre_fixer.py
 
 import logging
-from logging.handlers import RotatingFileHandler
-from typing import Optional, List
-from klassen.genius_client import GeniusClient
-from klassen.musicbrainz_client import MusicBrainzClient
-from klassen.lastfm_client import LastFMClient
+from typing import Optional
+from klassen.artist_map import ARTIST_GENRE_OVERRIDES
 from klassen.clean_artist import CleanArtist
-from helfer.artist_map import ARTIST_GENRE_MAP
+
+logger = logging.getLogger("GenreFetcher")
 
 class GenreFetcher:
-    """Bestimmt das Genre basierend auf Titel und K脙录nstler mit Caching, Logging und Fallback."""
+    """Bestimmt das Genre basierend auf Titel und Künstler, mit Logging und Fallback auf Artist-Map."""
 
     def __init__(self):
+        self.artist_genre_map = ARTIST_GENRE_OVERRIDES
         self.cleaner = CleanArtist()
-        self.genius = GeniusClient(self.cleaner)
-        self.musicbrainz = MusicBrainzClient()
-        self.lastfm = LastFMClient()
-        self.cache = {}
-
-        self.artist_genre_map = ARTIST_GENRE_MAP
-
-        self.logger = logging.getLogger("GenreFetcher")
-        self.logger.setLevel(logging.DEBUG)
-
-        # Dateibasiertes Logging mit Rotation
-        handler = RotatingFileHandler("logs/genre_fixer.log", maxBytes=2_000_000, backupCount=3)
-        formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
-        handler.setFormatter(formatter)
-        self.logger.addHandler(handler)
 
     async def get_genre(self, title: str, artist: str) -> Optional[str]:
-        clean_artist = artist.strip().lower()
-        cache_key = f"{clean_artist}|{title.strip().lower()}"
-        log_prefix = f"[{artist} 芒聙聞1陇7 {title}]"
+        clean_artist = self.cleaner.clean(artist).lower()
+        log_prefix = f"[{artist} – {title}]"
 
-        # Caching
-        if cache_key in self.cache:
-            self.logger.debug(f"{log_prefix} 芒職聞1陇7 Genre aus Cache: {self.cache[cache_key]}")
-            return self.cache[cache_key]
-
-        self.logger.debug(f"{log_prefix} 冒聼聰聧 Starte Genre-Erkennung")
+        logger.debug(f"{log_prefix} 🔍 Starte Genre-Erkennung")
 
         genre = await self.get_genre_from_musicbrainz(title, artist)
         if genre:
-            genre = self._normalize_genre(genre)
-            self.logger.info(f"{log_prefix} 芒聹聞1陇7 Genre 脙录ber MusicBrainz: {genre}")
-            self.cache[cache_key] = genre
+            logger.info(f"{log_prefix} ✅ Genre über MusicBrainz: {genre}")
             return genre
 
         genre = await self.get_genre_from_genius(title, artist)
         if genre:
-            genre = self._normalize_genre(genre)
-            self.logger.info(f"{log_prefix} 芒聹聞1陇7 Genre 脙录ber Genius: {genre}")
-            self.cache[cache_key] = genre
+            logger.info(f"{log_prefix} ✅ Genre über Genius: {genre}")
             return genre
 
         genre = await self.get_genre_from_lastfm(title, artist)
         if genre:
-            genre = self._normalize_genre(genre)
-            self.logger.info(f"{log_prefix} 芒聹聞1陇7 Genre 脙录ber Last.fm: {genre}")
-            self.cache[cache_key] = genre
+            logger.info(f"{log_prefix} ✅ Genre über Last.fm: {genre}")
             return genre
 
         genre = self.artist_genre_map.get(clean_artist)
         if genre:
-            self.logger.info(f"{log_prefix} 芒聞鹿茂赂聫 Fallback-Genre 脙录ber Artist-Zuordnung: {genre}")
+            logger.info(f"{log_prefix} ℹ️ Fallback-Genre über Artist-Zuordnung: {genre}")
         else:
-            self.logger.warning(f"{log_prefix} 芒聺聞1陇7 Kein Genre erkennbar")
+            logger.warning(f"{log_prefix} ❌ Kein Genre erkennbar")
 
-        self.cache[cache_key] = genre
         return genre
 
     async def get_genre_from_musicbrainz(self, title: str, artist: str) -> Optional[str]:
-        try:
-            result = await self.musicbrainz.fetch_metadata(title, artist)
-            genres = result.get("genres", [])
-            return self._get_first_valid_genre(genres)
-        except Exception as e:
-            self.logger.warning(f"[{artist} 芒聙聞1陇7 {title}] 芒職聽茂赂聫 MusicBrainz-Fehler: {e}")
-            return None
-
-    async def get_genre_from_genius(self, title: str, artist: str) -> Optional[str]:
-        try:
-            result = await self.genius.fetch_metadata(title, artist)
-            return result.get("genre")
-        except Exception as e:
-            self.logger.warning(f"[{artist} 芒聙聞1陇7 {title}] 芒職聽茂赂聫 Genius-Fehler: {e}")
-            return None
-
-    async def get_genre_from_lastfm(self, title: str, artist: str) -> Optional[str]:
-        try:
-            result = await self.lastfm.fetch_metadata(title, artist)
-            genres = result.get("genres", [])
-            return self._get_first_valid_genre(genres)
-        except Exception as e:
-            self.logger.warning(f"[{artist} 芒聙聞1陇7 {title}] 芒職聽茂赂聫 Last.fm-Fehler: {e}")
-            return None
-
-    def _get_first_valid_genre(self, genres: List[str]) -> Optional[str]:
-        for genre in genres:
-            norm = self._normalize_genre(genre)
-            if norm:
-                return norm
         return None
 
-    def _normalize_genre(self, genre: Optional[str]) -> Optional[str]:
-        if not genre:
-            return None
-        genre = genre.strip().lower()
+    async def get_genre_from_genius(self, title: str, artist: str) -> Optional[str]:
+        return None
 
-        # Optional: Gruppieren mehrerer 脙陇hnlicher Begriffe
-        mapping = {
-            "hip hop": "Hip-Hop",
-            "hip-hop": "Hip-Hop",
-            "rap": "Hip-Hop",
-            "trap": "Trap",
-            "pop": "Pop",
-            "rock": "Rock",
-            "r&b": "R&B",
-            "tropical house": "Tropical House",
-            "dance": "Dance",
-            "deep house": "Deep House",
-        }
-
-        return mapping.get(genre, genre.title())
+    async def get_genre_from_lastfm(self, title: str, artist: str) -> Optional[str]:
+        return None
