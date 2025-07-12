@@ -1,0 +1,1236 @@
+# -*- coding: utf-8 -*-
+from typing import Any, Dict, List, Union, Optional, Tuple
+
+try:
+    import httpx
+
+    HAS_HTTPX = True
+except ImportError:
+    import requests
+
+    HAS_HTTPX = False
+    from logger import log_info
+
+    log_info("httpx nicht verfügbar, verwende requests als Fallfall", "command_handler")
+import time
+import subprocess
+import requests
+import io
+from telegram.error import BadRequest
+from urllib.parse import quote
+from datetime import datetime, timedelta
+import re
+import json
+from collections import defaultdict
+import os
+import matplotlib.pyplot as plt
+from apscheduler.schedulers.background import BackgroundScheduler
+import psutil
+import asyncio
+import asyncio.subprocess
+from pathlib import Path
+from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup # NEU: Inline-Importe
+from telegram.ext import (
+    ContextTypes,
+    CommandHandler,
+    Application,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler # NEU: CallbackQueryHandler
+)
+from telegram.helpers import escape_markdown
+from api.navidrome_api import NavidromeAPI
+from services.commands_services import COMMAND_CATEGORIES, COMMAND_DESCRIPTIONS
+from handlers.button_handler import handle_button_click, handle_start, handle_help
+from handlers.cover_handler import handle_fixcovers
+from handlers.fixgenre_handler import handle_fix_genres
+from handlers.rescan_genres_handler import handle_rescan_genres
+from handlers.navidrome_handler import navidrome_stats, scan_command
+from handlers.check_artists_handler import handle_check_artists
+from handlers.reprocess_handler import reprocess_library
+from handlers.genre_handler import handle_genre_stats # Der bereits aktualisierte Genre-Handler
+from logger import log_info, log_error
+from config import Config # Stelle sicher, dass Config importiert ist
+from services.downloader import YoutubeDownloader
+from handlers.message_handler import handle_message
+from helfer.markdown_helfer import escape_md_v2
+from helfer.artist_map import artist_rules, ARTIST_NAME_OVERRIDES
+from emoji import EMOJI
+import logging
+logger = logging.getLogger("command_handler")
+
+
+class NavidromeStats:
+    # Übernahme der Pfade und Einstellungen aus Config
+    HISTORY_FILE = Config.PLAY_HISTORY_FILE
+    STATS_DIR = Config.STATS_DIR
+    HISTORY_MAX_DAYS = Config.PLAY_HISTORY_RETENTION_DAYS
+
+    def __init__(self):
+        # os.makedirs(self.STATS_DIR, exist_ok=True) # Dies wird nun von Config gehandhabt
+        self.setup_autosave()
+
+    def test_now_playing_api(self):
+        """Testet die API-Verbindung und Antwortstruktur"""
+        test_params = {
+            "u": Config.NAVIDROME_USER,
+            "p": quote(Config.NAVIDROME_PASS),
+            "v": "1.16.0",
+            "c": "play_stats",
+            "f": "json",
+        }
+        try:
+            response = requests.get(
+                f"{Config.NAVIDROME_URL.rstrip('/')}/rest/getNowPlaying.view",
+                params=test_params,
+                timeout=5,
+            )
+            response.raise_for_status()
+            data = response.json()
+            response_data = data.get("subsonic-response", {})
+            if "nowPlaying" not in response_data:
+                log_info(
+                    "API-Test: Keine nowPlaying-Daten erhalten (keine aktiven Plays?)",
+                    "NavidromeStats",
+                )
+                return False
+            if "entry" not in response_data["nowPlaying"]:
+                log_info(
+                    "API-Test: NowPlaying-Einträge fehlen (keine aktiven Plays)",
+                    "NavidromeStats",
+                )
+                return False
+            log_info(
+                "API-Test erfolgreich: NowPlaying-API antwortet korrekt",
+                "NavidromeStats",
+            )
+            return True
+        except requests.exceptions.RequestException as e:
+            log_error(
+                f"API-Test fehlgeschlagen: Verbindungsfehler - {str(e)}",
+                "NavidromeStats",
+            )
+            return False
+        except json.JSONDecodeError as e:
+            log_error(
+                f"API-Test fehlgeschlagen: Ungültige JSON-Antwort - {str(e)}",
+                "NavidromeStats",
+            )
+            return False
+        except Exception as e:
+            log_error(
+                f"API-Test fehlgeschlagen: Unerwarteter Fehler - {str(e)}",
+                "NavidromeStats",
+            )
+            return False
+
+    def setup_autosave(self):
+        """Richtet den automatischen Speicher-Job ein"""
+        self.scheduler = BackgroundScheduler()
+        self.scheduler.add_job(
+            self.save_play_history,
+            "interval",
+            minutes=Config.PLAY_HISTORY_AUTOSAVE_INTERVAL_MIN, # Nutzung der Einstellung aus Config
+            next_run_time=datetime.now(),
+        )
+        self.scheduler.start()
+
+    def cleanup_old_entries(self):
+        """Entfernt alte Einträge aus der History"""
+        try:
+            history = self.load_history()
+            if not history:
+                return
+            cutoff = datetime.now() - timedelta(days=self.HISTORY_MAX_DAYS)
+            cleaned_history = []
+            for entry in history:
+                if isinstance(entry, dict) and "timestamp" in entry:
+                    try:
+                        entry_time = datetime.fromisoformat(entry["timestamp"])
+                        if entry_time >= cutoff:
+                            cleaned_history.append(entry)
+                    except (ValueError, TypeError):
+                        continue
+            if len(cleaned_history) < len(history):
+                with open(self.HISTORY_FILE, "w") as f:
+                    json.dump(cleaned_history, f, indent=2)
+                log_info(
+                    f"History bereinigt: {len(history)-len(cleaned_history)} Einträge entfernt",
+                    "NavidromeStats",
+                )
+        except Exception as e:
+            log_error(f"Fehler beim Bereinigen der History: {str(e)}", "NavidromeStats")
+
+    def get_now_playing(self):
+        """Holt aktuell gespielte Titel von Navidrome mit vorherigem API-Test"""
+        if not self.test_now_playing_api():
+            log_info(
+                "API-Test fehlgeschlagen, überspringe NowPlaying-Abfrage",
+                "NavidromeStats",
+            )
+            return []
+        params = {
+            "u": Config.NAVIDROME_USER,
+            "p": quote(Config.NAVIDROME_PASS),
+            "v": "1.16.0",
+            "c": "play_stats",
+            "f": "json",
+        }
+        try:
+            response = requests.get(
+                f"{Config.NAVIDROME_URL.rstrip('/')}/rest/getNowPlaying.view",
+                params=params,
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+            response_data = data.get("subsonic-response", {})
+            if "nowPlaying" not in response_data:
+                return []
+            now_playing = response_data["nowPlaying"]
+            if "entry" not in now_playing:
+                return []
+            entries = now_playing["entry"]
+            return entries if isinstance(entries, list) else [entries]
+        except Exception as e:
+            log_error(
+                f"Fehler beim Abrufen der Now Playing Daten: {str(e)}",
+                "NavidromeStats",
+            )
+            return []
+
+    def save_play_history(self):
+        """Speichert aktuelle Plays in der History"""
+        try:
+            now_playing = self.get_now_playing()
+            if not now_playing:
+                return False
+    
+            history_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "tracks": [],
+            }
+    
+            for track in now_playing:
+                history_entry["tracks"].append(
+                    {
+                        "title": track.get("title") or "Unknown Title",
+                        "artist": track.get("artist") or "Unknown Artist",
+                        "album": track.get("album"),
+                        "duration": track.get("duration"),
+                        "player": track.get("playerName"),
+                        "username": track.get("username"),
+                    }
+                )
+    
+            try:
+                with open(self.HISTORY_FILE, "r") as f:
+                    history = json.load(f)
+                    if isinstance(history, dict):
+                        history = [history]
+            except (FileNotFoundError, json.JSONDecodeError):
+                history = []
+    
+            history.append(history_entry)
+    
+            with open(self.HISTORY_FILE, "w") as f:
+                json.dump(history, f, indent=2)
+    
+            # Eigene Log-Datei für History schreiben
+            try:
+                with open("/mnt/media/musiccenter/logs/history.log", "a", encoding="utf-8") as log_file:
+                    log_file.write(f"[{datetime.now().isoformat()}] Neue History: {json.dumps(history_entry, ensure_ascii=False)}\n")
+            except Exception as log_err:
+                log_error(f"Fehler beim Schreiben in history.log: {log_err}", "NavidromeStats")
+    
+            log_info(
+                f"Play History aktualisiert ({len(now_playing)} Tracks)",
+                "NavidromeStats",
+            )
+            self.cleanup_old_entries()
+            return True
+    
+        except Exception as e:
+            log_error(
+                f"Fehler beim Speichern der Play History: {str(e)}",
+                "NavidromeStats",
+            )
+            return False
+
+
+    def load_history(self):
+        """Lädt die gesamte Play History"""
+        try:
+            # `self.HISTORY_FILE` ist bereits ein Path-Objekt
+            with open(self.HISTORY_FILE, "r") as f:
+                history = json.load(f)
+                if isinstance(history, dict):
+                    return [history] # Korrektur für alte Formate
+                return history
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            log_error(f"Fehler beim Laden der History: {str(e)}", "NavidromeStats")
+            return []
+
+    def generate_stats(self, period="month"):
+        """Generiert Statistiken für den angegebenen Zeitraum mit verbesserter Fehlerbehandlung"""
+        history = self.load_history()
+        if not history:
+            return None
+        now = datetime.now()
+        if period == "week": # NEU
+            cutoff = now - timedelta(days=7)
+        elif period == "month":
+            cutoff = now - timedelta(days=30)
+        elif period == "year":
+            cutoff = now - timedelta(days=365)
+        else:
+            cutoff = datetime.min
+        
+        artist_counts = defaultdict(int)
+        song_counts = defaultdict(int)
+        album_counts = defaultdict(int)
+        total_plays = 0
+        for entry in history:
+            if not (
+                isinstance(entry, dict) and "timestamp" in entry and "tracks" in entry
+            ):
+                continue
+            try:
+                entry_time = datetime.fromisoformat(entry["timestamp"])
+            except (ValueError, TypeError):
+                continue
+            if entry_time < cutoff:
+                continue
+            tracks = entry.get("tracks")
+            if not isinstance(tracks, list):
+                continue
+            for track in tracks:
+                if not (
+                    isinstance(track, dict) and "artist" in track and "title" in track
+                ):
+                    continue
+                artist = track["artist"] or "Unknown Artist"
+                title = track["title"] or "Unknown Title"
+                album = track.get("album") or "Unknown Album"
+                song_key = f"{title} - {artist}"
+                album_key = f"{album} - {artist}"
+                artist_counts[artist] += 1
+                song_counts[song_key] += 1
+                album_counts[album_key] += 1
+                total_plays += 1
+        if total_plays == 0:
+            return None
+        top_artists = sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)[
+            :10
+        ]
+        top_songs = sorted(song_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_albums = sorted(album_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        return {
+            "period": period,
+            "total_plays": total_plays,
+            "top_artists": top_artists,
+            "top_songs": top_songs,
+            "top_albums": top_albums,
+            "from_date": cutoff.isoformat(),
+            "to_date": now.isoformat(),
+        }
+
+    def get_last_played_song(self) -> Optional[Dict[str, Any]]:
+        """Holt den zuletzt gespielten Song aus der History."""
+        history = self.load_history()
+        if not history:
+            return None
+
+        # Das letzte aufgezeichnete Ereignis finden
+        last_event = history[-1]
+        if not last_event or "tracks" not in last_event or not last_event["tracks"]:
+            return None
+
+        # Den letzten Track aus diesem Ereignis extrahieren
+        last_track = last_event["tracks"][-1]
+        last_track["timestamp"] = last_event.get("timestamp")
+        return last_track
+
+    def create_chart(self, stats, chart_type="songs"):
+        """Erstellt ein Diagramm der Top Songs oder Künstler"""
+        if chart_type == "songs":
+            data = [s[0] for s in stats["top_songs"]][::-1]
+            values = [s[1] for s in stats["top_songs"]][::-1]
+            title = f"Top Songs - {stats['period'].capitalize()}"
+            color = "skyblue"
+            emoji = EMOJI["song"]
+        else:
+            data = [a[0] for a in stats["top_artists"]][::-1]
+            values = [a[1] for a in stats["top_artists"]][::-1]
+            title = f"Top Artists - {stats['period'].capitalize()}"
+            color = "lightgreen"
+            emoji = EMOJI["artist"]
+        plt.figure(figsize=(10, 6))
+        bars = plt.barh(data, values, color=color)
+        plt.xlabel("Plays")
+        plt.title(f"{emoji} {title}")
+        for bar in bars:
+            width = bar.get_width()
+            plt.text(
+                width,
+                bar.get_y() + bar.get_height() / 2,
+                f" {int(width)}",
+                va="center",
+                ha="left",
+            )
+        filename = f"top_{chart_type}_{stats['period']}_{datetime.now().strftime('%Y%m%d')}.png"
+        # Nutzung von `self.STATS_DIR`, das nun ein Path-Objekt ist
+        filepath = self.STATS_DIR / filename
+        plt.tight_layout()
+        plt.savefig(filepath, bbox_inches="tight", dpi=100)
+        plt.close()
+        return filepath
+
+
+def escape_md_v2(text: str) -> str:
+    """Escapes MarkdownV2 special characters"""
+    # Alle notwendigen Zeichen, inkl. Backtick, sind hier enthalten
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+
+
+async def handle_youtube_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler für direkt gesendete YouTube-Links"""
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text
+    youtube_pattern = r"(https?://)?(www\.)?(youtube|youtu)\.(com|be)/.+"
+    if re.match(youtube_pattern, text):
+        msg = await update.message.reply_text(
+            f"{EMOJI['download']} YouTube-Link erkannt, starte Download..."
+        )
+        try:
+            downloader = YoutubeDownloader(update)
+            result = await downloader.download_audio(text)
+            processed_result = process_download_result(result)
+            if processed_result["success"]:
+                await handle_download_success(update, msg, processed_result)
+            else:
+                await handle_download_failure(update, msg, processed_result["error"])
+        except Exception as e:
+            error_msg = escape_md_v2(f"{EMOJI['error']} Fehler beim Download: {str(e)}")
+            await msg.edit_text(error_msg, parse_mode="MarkdownV2")
+            log_error(f"handle_youtube_links: {str(e)}", "command_handler")
+
+
+async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Behandelt den /download-Befehl zum Herunterladen von YouTube-Audios.
+    """
+    status_msg = await update.message.reply_text("Starte Download...")
+    url = context.args[0] if context.args else None
+
+    if not url:
+        await status_msg.edit_text("Bitte geben Sie eine URL an. Beispiel: /download https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        return
+
+    # Initialisieren des Downloaders
+    downloader = YoutubeDownloader(update) # Die Instanz wird hier erstellt
+
+    try:
+        # Führen Sie den Download durch. Interne Fehlerbehandlung (inkl. _handle_error) findet im Downloader statt.
+        processed_result = await downloader.download_audio(url)
+
+        if processed_result: # Stellen Sie sicher, dass ein Ergebnis vorhanden ist
+            await handle_download_success(update, status_msg, processed_result)
+        else:
+            # Dies sollte nur erreicht werden, wenn download_audio eine leere Liste zurückgibt,
+            # aber keinen Fehler auslöst. Im Normalfall sollte download_audio einen Fehler auslösen.
+            await handle_download_failure(update, status_msg, "Der Download ergab kein Ergebnis.")
+
+    except Exception as e:
+        # Hier fangen wir allgemeine Ausnahmen ab, die *nach* oder *während*
+        # des download_audio-Aufrufs auftreten könnten, aber nicht intern behandelt wurden.
+        # Wichtig: Wir versuchen NICHT, _handle_error hier auf dem 'downloader'-Objekt aufzurufen.
+        # Stattdessen übergeben wir die Fehlermeldung direkt an handle_download_failure.
+        error_message = f"❌ Ein unerwarteter Fehler ist aufgetreten: {str(e)}"
+        log_error(f"Unerwartete Ausnahme in handle_download: {str(e)}", context="command_handler", exc_info=True)
+        await handle_download_failure(update, status_msg, error_message)
+
+# ... (Ihre handle_download_success und handle_download_failure Funktionen bleiben wie sie sind,
+#      aber stellen Sie sicher, dass sie keine Versuche unternehmen,
+#      _handle_error aufzurufen)
+
+
+def process_download_result(result: Union[Dict[str, Any], str, None]) -> Dict[str, Any]:
+    response = {
+        "success": False,
+        "error": None,
+        "file_path": None,
+        "title": "Unbekannter Titel",
+        "filename": "unbekannte_datei",
+    }
+
+    if result is None:
+        response["error"] = "Download lieferte kein Ergebnis zurück"
+        return response
+
+    if isinstance(result, dict):
+        response.update(result)
+        # Erfolg nur setzen, wenn tatsächlich vorhanden und True
+        response["success"] = bool(result.get("success", False))
+        if not response["success"] and not response["error"]:
+            response["error"] = "Download fehlgeschlagen ohne Fehlermeldung"
+        return response
+
+    if isinstance(result, str):
+        response["error"] = result
+        return response
+
+    response["error"] = "Unbekanntes Ergebnisformat"
+    return response
+
+
+# Die doppelte Funktion wurde aus dieser Methode entfernt
+async def handle_download_success(
+    update: Update, status_msg: Message, result: Dict[str, Any]
+) -> None:
+    """Behandelt erfolgreichen Download mit formatierter Nachricht"""
+    log_info(f"Download erfolgreich: {result['title']}", "handle_download")
+
+    escaped_title = escape_md_v2(result['title'])
+    escaped_filename = escape_md_v2(result['filename'])
+
+    # ⚠️ Auch das ! muss escaped werden → besser alles escapen
+    escaped_header = escape_md_v2("Download erfolgreich!")
+
+    success_msg = (
+        f"{EMOJI['success']} *{escaped_header}*\n\n"
+        f"{EMOJI['music']} *Titel:* {escaped_title}\n"
+        f"{EMOJI['file']} *Datei:* `{escaped_filename}`\n\n"
+        f"{EMOJI['time']} Fertiggestellt\\!"
+    )
+
+    await status_msg.edit_text(success_msg, parse_mode="MarkdownV2")
+
+
+def is_probably_file_path(text: str) -> bool:
+    """Hilfsfunktion zur Erkennung von Pfadangaben statt echter Fehlermeldung."""
+    return (
+        text.startswith("/") or
+        "\\" in text or
+        text.count("/") >= 2 or
+        any(ext in text.lower() for ext in [".m4a", ".mp3", ".webm", ".wav"])
+    )
+
+
+# Beispiel für handle_download_failure (falls noch nicht vorhanden oder anders):
+async def handle_download_failure(update: Update, status_msg, error_msg: str):
+    """
+    Sendet eine Fehlermeldung nach einem fehlgeschlagenen Download.
+    """
+    # log_error wird hier verwendet, um den Fehler zu protokollieren.
+    # Es ruft NICHT _handle_error der YoutubeDownloader-Klasse auf.
+    log_error(f"Download fehlgeschlagen: {error_msg}", "handle_download")
+
+    try:
+        await status_msg.edit_text(
+            f"❌ *Download fehlgeschlagen*\n\n"
+            f"Fehler: `{error_msg}`\n\n"
+            f"Bitte versuche es später erneut oder mit einem anderen Link.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log_error(f"Fehler beim Senden der Download-Fehlermeldung: {str(e)}", "command_handler")
+
+
+async def send_song_info(update: Update, song: dict) -> None:
+    """Sendet Song-Informationen mit korrekt escapedem Markdown"""
+    # Use a more flexible way to reply based on context
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in send_song_info", "command_handler")
+        return
+
+    try:
+        title = escape_md_v2(song.get("title", "Unknown Title"))
+        artist = escape_md_v2(song.get("artist", "Unknown Artist"))
+        album = escape_md_v2(song.get("album", ""))
+        message = f"{EMOJI['music']} *{title}* \\- *{artist}*"
+        if album:
+            message += f"\n{EMOJI['album']} *{album}*"
+        await reply_target.reply_text(message, parse_mode="MarkdownV2")
+    except Exception as e:
+        error_message = (
+            f"Song Info: {song.get('title', 'Unknown')} - "
+            f"{song.get('artist', 'Unknown')}"
+        )
+        await reply_target.reply_text(error_message)
+        log_error(f"Fehler in send_song_info: {str(e)}", "command_handler")
+
+async def test_navidrome_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Testet die Navidrome API und gibt Feedback"""
+    # Use a more flexible way to reply based on context
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in test_navidrome_api", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(
+        f"{EMOJI['processing']} Teste Navidrome API..."
+    )
+    try:
+        try:
+            ping_result = NavidromeAPI.make_request("ping")
+            server_version = ping_result.get("serverVersion", "unbekannt")
+            await msg.edit_text(
+                f"{EMOJI['processing']} API erreichbar (v{server_version})..."
+            )
+        except Exception as e:
+            await msg.edit_text(
+                f"{EMOJI['error']} API nicht erreichbar\nFehler: {str(e)}"
+            )
+            return
+        try:
+            navidrome_stats_instance = NavidromeStats() # Create instance if not already passed/available
+            now_playing = navidrome_stats_instance.get_now_playing() # Use instance method
+            if not now_playing:
+                await msg.edit_text(
+                    f"{EMOJI['warning']} API erreichbar aber keine aktiven Plays"
+                )
+                return
+            await msg.edit_text(
+                f"{EMOJI['success']} API voll funktionsfähig\nAktive Plays: {len(now_playing)}"
+            )
+        except Exception as e:
+            await msg.edit_text(
+                f"{EMOJI['warning']} API teilweise funktionsfähig\nNowPlaying-Fehler: {str(e)}"
+            )
+    except Exception as e:
+        await msg.edit_text(f"{EMOJI['error']} Kritischer Testfehler: {str(e)}")
+
+async def get_now_playing(use_cache: bool = True) -> List[Dict[str, Any]]:
+    """Holt die aktuell spielenden Titel von Navidrome mit erweiterter Fehlerbehandlung und optionalem Caching"""
+    if use_cache:
+        if hasattr(get_now_playing, "_last_fetch"):
+            time_since_last = time.time() - get_now_playing._last_fetch
+            if time_since_last < 5 and hasattr(get_now_playing, "_cached_result"):
+                return get_now_playing._cached_result
+    try:
+        params = {
+            "u": Config.NAVIDROME_USER,
+            "p": quote(Config.NAVIDROME_PASS),
+            "v": "1.16.0",
+            "c": "yt_music_bot",
+            "f": "json",
+        }
+        if HAS_HTTPX:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{Config.NAVIDROME_URL.rstrip('/')}/rest/getNowPlaying.view",
+                    params=params,
+                )
+                response.raise_for_status()
+                data = response.json()
+        else:
+            response = requests.get(
+                f"{Config.NAVIDROME_URL.rstrip('/')}/rest/getNowPlaying.view",
+                params=params,
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+        response_data = data.get("subsonic-response", {})
+        entries = response_data.get("nowPlaying", {}).get("entry", [])
+        result = entries if isinstance(entries, list) else [entries] if entries else []
+        valid_entries = []
+        for entry in result:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                valid_entries.append(
+                    {
+                        "title": escape_md_v2(entry.get("title", "Unknown Title")),
+                        "artist": escape_md_v2(entry.get("artist", "Unknown Artist")),
+                        "album": (
+                            escape_md_v2(entry.get("album", "")) if entry.get("album") else None
+                        ),
+                        "player": (
+                            escape_md_v2(entry.get("playerName", "")) if entry.get("playerName") else None
+                        ),
+                        "username": escape_md_v2(entry.get("username", "")),
+                        "_raw": {
+                            "title": entry.get("title"),
+                            "artist": entry.get("artist"),
+                            "album": entry.get("album"),
+                            "player": entry.get("playerName"),
+                            "username": entry.get("username"),
+                        },
+                    }
+                )
+            except Exception as e:
+                log_error(
+                    f"Fehler beim Escaping der Track-Daten: {str(e)}",
+                    "NavidromeStats",
+                )
+                continue
+        if use_cache:
+            get_now_playing._last_fetch = time.time()
+            get_now_playing._cached_result = valid_entries
+        return valid_entries
+    except Exception as e:
+        error_type = "httpx.RequestError" if HAS_HTTPX else "requests.RequestError"
+        log_error(f"NowPlaying API Fehler ({error_type}): {str(e)}", "NavidromeStats")
+        return []
+
+def escape_text_md2(text: Any) -> str:
+    """Kombiniert Backslash-Escaping und MarkdownV2-Escaping"""
+    text = str(text).replace("\\", "\\\\")
+    return escape_md_v2(text)
+
+async def handle_playing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt aktuell spielende Titel an"""
+    # Use a more flexible way to reply based on context
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_playing", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(
+        f"{EMOJI['processing']} Lade aktuelle Titel..."
+    )
+    try:
+        now_playing = await get_now_playing()
+        if not now_playing:
+            await msg.edit_text(
+                f"{EMOJI['warning']} Es wird aktuell nichts gespielt.",
+                parse_mode="MarkdownV2",
+            )
+            return
+        response = [f"{EMOJI['music']} *Aktuell spielend:*"]
+        for idx, track in enumerate(now_playing, 1):
+            title = escape_text_md2(track.get("title", "Unknown Title"))
+            artist = escape_text_md2(track.get("artist", "Unknown Artist"))
+            album = (
+                escape_text_md2(track.get("album", "")) if track.get("album") else None
+            )
+            player = (
+                escape_text_md2(track.get("playerName", "")) if track.get("playerName") else None
+            )
+            track_info = [f"{escape_text_md2(idx)}\\. *{title}* \\- *{artist}*"]
+            if album:
+                track_info.append(f" {EMOJI['album']} *{album}*")
+            if player:
+                track_info.append(f" {EMOJI['player']} {player}")
+            response.append("\n".join(track_info))
+        await msg.edit_text("\n\n".join(response), parse_mode="MarkdownV2")
+    except Exception as e:
+        await msg.edit_text(
+            f"{EMOJI['error']} Fehler beim Abrufen der aktuellen Titel.",
+            parse_mode="MarkdownV2",
+        )
+        log_error(f"handle_playing error: {str(e)}", "command_handler")
+
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt den Systemstatus an"""
+    # Verwende das geeignete Nachrichtenobjekt für die Antwort
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_status", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(
+        f"{EMOJI['processing']} Prüfe Systemstatus..."
+    )
+    try:
+        storage = psutil.disk_usage("/")
+        used_gb = round(storage.used / (1024**3), 1)
+        total_gb = round(storage.total / (1024**3), 1)
+        storage_text = f"{used_gb}GB/{total_gb}GB genutzt ({storage.percent}%)"
+        try:
+            stats = await get_navidrome_stats()
+            navidrome_status = "Verbunden" if stats else "Nicht verbunden"
+        except:
+            navidrome_status = "Nicht verbunden"
+        status_lines = [
+            f"{EMOJI['success']} *Systemstatus*",
+            f"{EMOJI['running']} Bot: Online",
+            f"{EMOJI['navidrome']} Navidrome: {navidrome_status}",
+            f"{EMOJI['storage']} Speicher: {storage_text}",
+        ]
+        await msg.edit_text(
+            escape_md_v2("\n".join(status_lines)), parse_mode="MarkdownV2"
+        )
+    except Exception as e:
+        log_error(f"Fehler in handle_status: {str(e)}", "command_handler")
+        await msg.edit_text(
+            f"{EMOJI['error']} Status konnte nicht ermittelt werden",
+            parse_mode="MarkdownV2",
+        )
+
+
+async def handle_top_songs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt die Top 10 Songs an"""
+    # Verwende das geeignete Nachrichtenobjekt für die Antwort
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_top_songs", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(f"{EMOJI['processing']} Lade Top Songs ...")
+    try:
+        stats = NavidromeStats().generate_stats("month")
+        if not stats or not stats["top_songs"]:
+            await msg.edit_text(
+                f"{EMOJI['warning']} Keine Song-Daten verfügbar.",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        def escape_text(text):
+            text = str(text)
+            text = text.replace("\\", "\\\\")
+            text = escape_md_v2(text)
+            return text
+
+        songs_text = []
+        for idx, song in enumerate(stats["top_songs"]):
+            escaped_title = escape_text(song[0])
+            escaped_count = escape_text(song[1])
+            songs_text.append(
+                f"{escape_text(idx+1)}\\. {escaped_title} \\({escaped_count} Plays\\)"
+            )
+        response_text = (
+            f"{EMOJI['topsongs']} *Top Songs \\(30 Tage\\)\\:*\n\n"
+            + "\n".join(songs_text)
+            + f"\n\n{EMOJI['statistics']} Gesamt Plays\\: {escape_text(stats['total_plays'])}"
+        )
+        await msg.edit_text(response_text, parse_mode="MarkdownV2")
+        chart_path = NavidromeStats().create_chart(stats, "songs")
+        with open(chart_path, "rb") as chart_file:
+            await reply_target.reply_photo( # Geändert zu reply_target
+                photo=chart_file,
+                caption=f"{EMOJI['topsongs']} Top Songs Visualisierung",
+            )
+    except Exception as e:
+        error_text = escape_md_v2(f"{EMOJI['error']} Fehler: {str(e)}")
+        await msg.edit_text(error_text, parse_mode="MarkdownV2")
+        log_error(f"handle_top_songs: {str(e)}", "command_handler")
+
+
+async def handle_top_artists(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt die Top 10 Künstler an"""
+    # Verwende das geeignete Nachrichtenobjekt für die Antwort
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_top_artists", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(
+        f"{EMOJI['processing']} Lade Top Künstler ..."
+    )
+    try:
+        stats = NavidromeStats().generate_stats("month")
+        if not stats or not stats["top_artists"]:
+            await msg.edit_text(
+                f"{EMOJI['warning']} Keine Künstler-Daten verfügbar.",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        def escape_text(text):
+            text = str(text)
+            text = text.replace("\\", "\\\\")
+            text = escape_md_v2(text)
+            return text
+
+        artists_text = []
+        for idx, (artist, count) in enumerate(stats["top_artists"]):
+            escaped_artist = escape_text(artist)
+            escaped_count = escape_text(count)
+            artists_text.append(
+                f"{escape_text(idx+1)}\\. {escaped_artist} \\({escaped_count} Plays\\)"
+            )
+        response_text = (
+            f"{EMOJI['topartists']} *Top Künstler \\(30 Tage\\)\\:*\n\n"
+            + "\n".join(artists_text)
+            + f"\n\n{EMOJI['statistics']} Gesamt Plays\\: {escape_text(stats['total_plays'])}"
+        )
+        await msg.edit_text(response_text, parse_mode="MarkdownV2")
+        chart_path = NavidromeStats().create_chart(stats, "artists")
+        with open(chart_path, "rb") as chart_file:
+            await reply_target.reply_photo( # Geändert zu reply_target
+                photo=chart_file,
+                caption=f"{EMOJI['topartists']} Top Künstler Visualisierung",
+                parse_mode="MarkdownV2",
+            )
+    except Exception as e:
+        error_text = f"{EMOJI['error']} Fehler: {escape_md_v2(str(e))}"
+        await msg.edit_text(error_text, parse_mode="MarkdownV2")
+        log_error(f"handle_top_artists: {str(e)}", "command_handler")
+
+async def handle_top_songs_7_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt die Top 10 Songs der letzten 7 Tage an."""
+    # Verwende das geeignete Nachrichtenobjekt für die Antwort
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_top_songs_7_days", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(f"{EMOJI['processing']} Lade Top Songs (7 Tage)...")
+    try:
+        stats = NavidromeStats().generate_stats("week")
+        if not stats or not stats["top_songs"]:
+            await msg.edit_text(
+                f"{EMOJI['warning']} Keine Song-Daten für die letzten 7 Tage verfügbar.",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        def escape_text(text):
+            return escape_md_v2(str(text).replace("\\", "\\\\"))
+
+        songs_text = []
+        for idx, song in enumerate(stats["top_songs"]):
+            escaped_title = escape_text(song[0])
+            escaped_count = escape_text(song[1])
+            songs_text.append(
+                f"{escape_text(idx+1)}\\. {escaped_title} \\({escaped_count} Plays\\)"
+            )
+        
+        response_text = (
+            f"{EMOJI['topsongs']} *Top Songs \\(7 Tage\\)\\:*\n\n"
+            + "\n".join(songs_text)
+            + f"\n\n{EMOJI['statistics']} Gesamt Plays im Zeitraum\\: {escape_text(stats['total_plays'])}"
+        )
+        await msg.edit_text(response_text, parse_mode="MarkdownV2")
+
+    except Exception as e:
+        error_text = escape_md_v2(f"{EMOJI['error']} Fehler: {str(e)}")
+        await msg.edit_text(error_text, parse_mode="MarkdownV2")
+        log_error(f"handle_top_songs_7_days: {str(e)}", "command_handler")
+
+
+async def handle_last_played(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt den zuletzt gespielten Titel an mit korrektem MarkdownV2-Escaping."""
+    try:
+        # Ziel für die Antwortnachricht bestimmen
+        reply_target = update.callback_query.message if update.callback_query else update.message
+        if not reply_target:
+            log_error("Kein Nachrichtenkontext für Antwort in handle_last_played", "command_handler")
+            return
+
+        # Verarbeitungsnachricht senden
+        processing_msg = await reply_target.reply_text(f"{EMOJI['processing']} Suche letzten Song...")
+
+        # Daten abrufen
+        stats_obj = NavidromeStats()
+        last_song = stats_obj.get_last_played_song()
+
+        if not last_song:
+            await processing_msg.edit_text(
+                f"{EMOJI['warning']} Keine Songs in der History gefunden.",
+                parse_mode="MarkdownV2"
+            )
+            return
+
+        # Hilfsfunktion für sicheres Escaping (Telegram MarkdownV2)
+        def safe_escape(text):
+            if not text:
+                return ""
+            text = str(text).replace("\\", "\\\\")
+            return escape_markdown(text, version=2)
+
+        # Daten escapen
+        title = safe_escape(last_song.get('title'))
+        artist = safe_escape(last_song.get('artist'))
+        album = safe_escape(last_song.get('album'))
+        duration = safe_escape(last_song.get('duration'))
+        played_at = safe_escape(last_song.get('timestamp')) # Korrigiert: 'timestamp' statt 'played_at'
+
+        # Formatierte Antwort
+        response = (
+            f"{EMOJI['lastplayed']} *Zuletzt gespielt:*\n\n"
+            f"🎵 *Titel:* `{title}`\n"
+            f"🎤 *Künstler:* `{artist}`\n"
+            f"💿 *Album:* `{album}`\n"
+            f"⏱️ *Dauer:* `{duration} Sekunden`\n" # Angenommen, Dauer ist in Sekunden
+            f"📅 *Zeitpunkt:* `{played_at}`"
+        )
+
+        await processing_msg.edit_text(
+            text=response,
+            parse_mode="MarkdownV2"
+        )
+
+    except Exception as e:
+        error_text = safe_escape(str(e))
+        error_msg = f"{EMOJI['error']} Fehler: `{error_text}`"
+        log_error(f"Fehler in handle_last_played: {str(e)}", "command_handler")
+        if 'processing_msg' in locals():
+            await processing_msg.edit_text(
+                text=error_msg,
+                parse_mode="MarkdownV2"
+            )
+
+async def handle_month_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Erstellt den Monatsrückblick"""
+    # Verwende das geeignete Nachrichtenobjekt für die Antwort
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_month_review", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(
+        f"{EMOJI['processing']} Erstelle Monatsrückblick ..."
+    )
+    try:
+        stats = NavidromeStats().generate_stats("month")
+        if not stats:
+            await msg.edit_text(
+                f"{EMOJI['warning']} Keine Daten verfügbar.", parse_mode="MarkdownV2"
+            )
+            return
+
+        def escape_text(text):
+            text = str(text)
+            text = text.replace("\\", "\\\\")
+            text = escape_md_v2(text)
+            return text
+
+        escaped_total_plays = escape_text(stats["total_plays"])
+        top_songs_lines = []
+        for idx, song in enumerate(stats["top_songs"]):
+            escaped_title = escape_text(song[0])
+            escaped_count = escape_text(song[1])
+            top_songs_lines.append(
+                f"{escape_text(idx+1)}\\. {escaped_title} \\({escaped_count} Plays\\)"
+            )
+        top_artists_lines = []
+        for idx, artist in enumerate(stats["top_artists"]):
+            escaped_name = escape_text(artist[0])
+            escaped_count = escape_text(artist[1])
+            top_artists_lines.append(
+                f"{escape_text(idx+1)}\\. {escaped_name} \\({escaped_count} Plays\\)"
+            )
+        top_albums_lines = []
+        for idx, album in enumerate(stats["top_albums"]):
+            escaped_title = escape_text(album[0])
+            escaped_count = escape_text(album[1])
+            top_albums_lines.append(
+                f"{escape_text(idx+1)}\\. {escaped_title} \\({escaped_count} Plays\\)"
+            )
+        report_lines = [
+            f"{EMOJI['calendar']} *Monatsrückblick \\(30 Tage\\)\\:*",
+            f"{EMOJI['statistics']} Gesamt Plays\\: {escaped_total_plays}",
+            "",
+            f"{EMOJI['trophy']} *Top Songs\\:*",
+            *top_songs_lines,
+            "",
+            f"{EMOJI['trophy']} *Top Künstler\\:*",
+            *top_artists_lines,
+            "",
+            f"{EMOJI['trophy']} *Top Alben\\:*",
+            *top_albums_lines,
+        ]
+        await msg.edit_text("\n".join(report_lines), parse_mode="MarkdownV2")
+        stats_obj = NavidromeStats()
+        with open(stats_obj.create_chart(stats, "songs"), "rb") as f1, open(
+            stats_obj.create_chart(stats, "artists"), "rb"
+        ) as f2:
+            await reply_target.reply_photo( # Geändert zu reply_target
+                photo=f1, caption=f"{EMOJI['topsongs']} Top Songs des Monats"
+            )
+            await reply_target.reply_photo( # Geändert zu reply_target
+                photo=f2,
+                caption=f"{EMOJI['topartists']} Top Künstler des Monats",
+            )
+    except Exception as e:
+        error_text = escape_md_v2(f"{EMOJI['error']} Fehler: {str(e)}")
+        await msg.edit_text(error_text, parse_mode="MarkdownV2")
+        log_error(f"handle_month_review: {str(e)}", "command_handler")
+
+
+async def handle_year_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Erstellt den Jahresrückblick"""
+    # Verwende das geeignete Nachrichtenobjekt für die Antwort
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_year_review", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(
+        f"{EMOJI['processing']} Erstelle Jahresrückblick ..."
+    )
+    try:
+        stats = NavidromeStats().generate_stats("year")
+        if not stats:
+            await msg.edit_text(
+                f"{EMOJI['warning']} Keine Daten verfügbar.", parse_mode="MarkdownV2"
+            )
+            return
+
+        def escape_text(text):
+            text = str(text)
+            text = text.replace("\\", "\\\\")
+            text = escape_md_v2(text)
+            return text
+
+        escaped_total_plays = escape_text(stats["total_plays"])
+        top_songs_lines = []
+        for idx, song in enumerate(stats["top_songs"]):
+            escaped_title = escape_text(song[0])
+            escaped_count = escape_text(song[1])
+            top_songs_lines.append(
+                f"{escape_text(idx+1)}\\. {escaped_title} \\({escaped_count} Plays\\)"
+            )
+        top_artists_lines = []
+        for idx, artist in enumerate(stats["top_artists"]):
+            escaped_name = escape_text(artist[0])
+            escaped_count = escape_text(artist[1])
+            top_artists_lines.append(
+                f"{escape_text(idx+1)}\\. {escaped_name} \\({escaped_count} Plays\\)"
+            )
+        top_albums_lines = []
+        for idx, album in enumerate(stats["top_albums"]):
+            escaped_title = escape_text(album[0])
+            escaped_count = escape_text(album[1])
+            top_albums_lines.append(
+                f"{escape_text(idx+1)}\\. {escaped_title} \\({escaped_count} Plays\\)"
+            )
+        report_lines = [
+            f"{EMOJI['yearreview']} *Jahresrückblick \\(365 Tage\\)\\:*",
+            f"{EMOJI['statistics']} Gesamt Plays\\: {escaped_total_plays}",
+            "",
+            f"{EMOJI['trophy']} *Top Songs\\:*",
+            *top_songs_lines,
+            "",
+            f"{EMOJI['trophy']} *Top Künstler\\:*",
+            *top_artists_lines,
+            "",
+            f"{EMOJI['trophy']} *Top Alben\\:*",
+            *top_albums_lines,
+        ]
+        await msg.edit_text("\n".join(report_lines), parse_mode="MarkdownV2")
+        stats_obj = NavidromeStats()
+        with open(stats_obj.create_chart(stats, "songs"), "rb") as f1, open(
+            stats_obj.create_chart(stats, "artists"), "rb"
+        ) as f2:
+            await reply_target.reply_photo( # Geändert zu reply_target
+                photo=f1, caption=f"{EMOJI['topsongs']} Top Songs des Jahres"
+            )
+            await reply_target.reply_photo( # Geändert zu reply_target
+                photo=f2,
+                caption=f"{EMOJI['topartists']} Top Künstler des Jahres",
+            )
+    except Exception as e:
+        error_text = escape_md_v2(f"{EMOJI['error']} Fehler: {str(e)}")
+        await msg.edit_text(error_text, parse_mode="MarkdownV2")
+        log_error(f"handle_year_review: {str(e)}", "command_handler")
+
+
+async def handle_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Erstellt ein System-Backup"""
+    # Verwende das geeignete Nachrichtenobjekt für die Antwort
+    reply_target = update.callback_query.message if update.callback_query else update.message
+    if not reply_target:
+        log_error("No message context to reply to in handle_backup", "command_handler")
+        return
+
+    msg = await reply_target.reply_text(
+        f"{EMOJI['processing']} Starte Backup-Prozess..."
+    )
+    try:
+        backup_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "backup.sh"
+        )
+        process = await asyncio.create_subprocess_shell(
+            f"bash {backup_script}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode == 0:
+            log_lines = stdout.decode().split("\n")[-6:-1]
+            summary = "\n".join(line for line in log_lines if line.strip())
+            await msg.edit_text(
+                f"{EMOJI['success']} *Backup erfolgreich*\n\n" f"```\n{summary}\n```",
+                parse_mode="MarkdownV2",
+            )
+        else:
+            error_msg = stderr.decode() or stdout.decode()
+            await msg.edit_text(
+                f"{EMOJI['error']} *Backup fehlgeschgeben*\n\n"
+                f"```\n{error_msg[-400:]}\n```",
+                parse_mode="MarkdownV2",
+            )
+            log_error(f"Backup failed: {error_msg}", "command_handler")
+    except Exception as e:
+        await msg.edit_text(
+            f"{EMOJI['error']} Fehler beim Backup: {escape_md_v2(str(e))}",
+            parse_mode="MarkdownV2",
+        )
+        log_error(f"Backup error: {str(e)}", "command_handler")
+
+
+def register_command_handlers(application: Application):
+    """Registriert alle Befehls-Handler mit korrekter Struktur"""        
+    # Navidrome Befehle
+    application.add_handler(CommandHandler("navidrome", navidrome_stats))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("genres", handle_genre_stats)) # Der aktualisierte Genre-Statistik-Handler
+    application.add_handler(CommandHandler("topsongs", handle_top_songs))
+    application.add_handler(CommandHandler("topsongs7", handle_top_songs_7_days))
+    application.add_handler(CommandHandler("topartists", handle_top_artists))
+    application.add_handler(CommandHandler("monthreview", handle_month_review))
+    application.add_handler(CommandHandler("yearreview", handle_year_review))
+    application.add_handler(CommandHandler("playing", handle_playing))
+    application.add_handler(CommandHandler("lastplayed", handle_last_played))
+    
+    # Navidrome Konfiguration (Wartung & Korrektur)
+    application.add_handler(CommandHandler("testapi", test_navidrome_api))
+    application.add_handler(CommandHandler("fixcovers", handle_fixcovers)) # Aktualisierter Handler
+    application.add_handler(CommandHandler("fixgenres", handle_fix_genres)) # Aktualisierter Handler
+    application.add_handler(CommandHandler("rescan_genres", handle_rescan_genres)) # Aktualisierter Handler
+    application.add_handler(CommandHandler("check_artists", handle_check_artists))
+
+    # YouTube Befehle
+    application.add_handler(CommandHandler("download", handle_download))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_links)
+    )
+    
+    # Systembefehle
+    application.add_handler(CommandHandler("start", handle_start))
+    application.add_handler(CommandHandler("help", handle_help))
+    application.add_handler(CommandHandler("status", handle_status))
+    application.add_handler(CommandHandler("backup", handle_backup))
+    application.add_handler(CommandHandler("reprocess_library", reprocess_library))
+
+    # NEU: Der generische CallbackQueryHandler für alle Button-Klicks
+    # Dieser sollte die meisten Button-Interaktionen abdecken.
+    application.add_handler(CallbackQueryHandler(handle_button_click))
+
+
+# Die main-Funktion wurde von mir nicht geändert, da sie sich in der main.py befinden sollte.
+# Ich gehe davon aus, dass du sie dort hast und sie `register_command_handlers` aufruft.
+# def main():
+#     """Startet den Bot mit korrekter Initialisierung"""
+#     application = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+
+#     # 1. Befehls-Handler registrieren
+#     register_command_handlers(application)
+
+#     # 2. Bot starten
+#     logging.info("? Bot wird gestartet...")
+#     try:
+#         application.run_polling()
+#     except Exception as e:
+#         logging.critical(f"Bot fehlgeschlagen: {str(e)}", exc_info=True)
+#     finally:
+#         logging.info("? Bot wurde beendet")
+
+
+# if __name__ == "__main__":
+#     # Logging vorbereiten
+#     logging.basicConfig(
+#         level=logging.INFO,
+#         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+#         handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
+#     )
+#     main()

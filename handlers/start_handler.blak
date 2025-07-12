@@ -1,0 +1,72 @@
+# /handlers/start_handler.py
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+import logging
+
+logger = logging.getLogger(__name__)
+
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Sendet eine personalisierte Willkommensnachricht und bietet Optionen an.
+    Wird bei /start Befehl oder Klick auf den /start Button aufgerufen.
+    """
+    user = update.effective_user
+    if not user:
+        logger.warning("Kein effektiver Benutzer im Update-Objekt gefunden.")
+        return
+
+    welcome_message = (
+        f"🌟 Herzlich willkommen, {user.mention_html()}! Ich bin dein persönlicher Musik-Bot.\n\n"
+        "Ich helfe dir dabei, Musik von YouTube herunterzuladen und zu verwalten.\n\n"
+        "Wähle eine Option oder gib einen Befehl ein:"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🎶 Musik herunterladen", callback_data="download_music"),
+            InlineKeyboardButton("❓ Hilfe", callback_data="/help")
+        ],
+        [
+            InlineKeyboardButton("ℹ️ Status überprüfen", callback_data="/status"),
+            # NEU: Der /start Button
+            InlineKeyboardButton("🚀 Start", callback_data="/start")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.message.reply_html(
+            welcome_message,
+            reply_markup=reply_markup
+        )
+        await update.callback_query.answer("Willkommensnachricht gesendet")
+    elif update.message:
+        await update.message.reply_html(
+            welcome_message,
+            reply_markup=reply_markup
+        )
+
+async def handle_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Wird ausgeführt, wenn der Inline-Button '/start' gedrückt wird.
+    Diese Funktion ruft die handle_start Funktion auf, um die Begrüßungsnachricht zu senden.
+    """
+    query = update.callback_query
+    if not query:
+        logger.warning("Keine CallbackQuery im Update-Objekt gefunden.")
+        return
+
+    callback_data = query.data
+
+    if callback_data == "/start":
+        logger.info("🔁 /start-Button wurde gedrückt")
+        try:
+            await handle_start(update, context)
+            await query.answer("✅ /start ausgeführt")
+        except Exception as e:
+            logger.error(f"❌ Fehler beim Ausführen von /start: {e}", exc_info=True)
+            await query.answer("❌ Fehler bei /start")
+    else:
+        logger.warning(f"⚠️ Unbekannte Callback-Query erhalten: {callback_data}")
+        await query.answer("❓ Unbekannter Button")

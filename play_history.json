@@ -1,0 +1,54 @@
+[
+  {
+    "timestamp": "2025-07-09T01:52:22.840367",
+    "tracks": [
+      {
+        "title": "Zartmann x Gustav",
+        "artist": "Zartmann",
+        "album": "schönhauser EP",
+        "duration": 153,
+        "player": "Symfonium",
+        "username": "dkmd"
+      }
+    ]
+  },
+  {
+    "timestamp": "2025-07-09T02:10:31.248563",
+    "tracks": [
+      {
+        "title": "Koma - Eine Nacht, die niemals endet",
+        "artist": "Böhse Onkelz",
+        "album": "E.I.N.S.",
+        "duration": 297,
+        "player": "Symfonium",
+        "username": "dkmd"
+      }
+    ]
+  },
+  {
+    "timestamp": "2025-07-09T02:10:37.079441",
+    "tracks": [
+      {
+        "title": "Koma - Eine Nacht, die niemals endet",
+        "artist": "Böhse Onkelz",
+        "album": "E.I.N.S.",
+        "duration": 297,
+        "player": "Symfonium",
+        "username": "dkmd"
+      }
+    ]
+  },
+  {
+    "timestamp": "2025-07-09T02:10:37.760207",
+    "tracks": [
+      {
+        "title": "Koma - Eine Nacht, die niemals endet",
+        "artist": "Böhse Onkelz",
+        "album": "E.I.N.S.",
+        "duration": 297,
+        "player": "Symfonium",
+        "username": "dkmd"
+      }
+    ]
+  }
+]

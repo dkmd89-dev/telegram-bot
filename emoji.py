@@ -1,0 +1,60 @@
+# emoji.py
+
+EMOJI = {
+    "start": "🚀",
+    "success": "✅",
+    "error": "❌",
+    "warning": "⚠️",
+    "info": "ℹ️",
+    "callback_data": "⚠️",
+    "download": "📥",
+    "processing": "⚙️",
+    "rescan_genres": "🔄", # Anpassung des Emojis für Rescan
+    "genres": "📊",
+    "time": "⏰",
+    "help": "❓",
+    "status": "📊",
+    'fixgenres': '🏷️',  # Added for fixgenres command
+    "navidrome": "🎵",
+    "scan": "📡",
+    "topsongs": "🏆",
+    "topartists": "🧑‍🎤",
+    "yearreview": "🗓️",
+    "music": "🎶",
+    "lastplayed": "🎶",
+    "file": "📁",
+    "done": "✅",
+    "player": "▶️",
+    "playlist": "📜",
+    "album": "📀",
+    "statistics": "📈",
+    "artist": "🎤",
+    "song": "🎵",
+    "running": "🟢",
+    "idle": "⚪",
+    "storage": "💾",
+    "backup": "📦",
+    "youtube": "📺",
+    "system": "💻",
+    "update": "🔄",
+    "fixcovers": "🖼️", # Anpassung des Emojis für Fixcovers
+    "fixgenre": "🎵",  # Anpassung des Emojis für Fixgenre
+    "search": "🔍",
+    "progress": "⏳",  # oder z. B. 🟢, ⏳, 🔄, je nach Geschmack
+    "calendar": "📆",
+    "trophy": "🏆",
+    "playing": "▶️",
+    "now_playing": "🎧",
+    "volume": "🔊",
+    "shuffle": "🔀",
+    "repeat": "🔁",
+    "heart": "❤️",
+    "broken_heart": "💔",
+    "star": "⭐",
+    "fire": "🔥",
+    "thumbs_up": "👍",
+    "robot": "🤖",
+    "warning_sign": "⚠️",
+    "loading": "⏳", # Hinzugefügt für Ladezustände in Handlern
+    "skip": "⏭️" # Hinzugefügt für übersprungene Elemente
+}
