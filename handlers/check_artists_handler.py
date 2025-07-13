@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from config import Config
-from helfer.artist_map import artist_rules, ARTIST_NAME_OVERRIDES
+from klassen.artist_map import ARTIST_RULES, ARTIST_OVERRIDES
 from helfer.genre_helfer import get_tags_from_file
 
 from telegram import Update
@@ -21,7 +21,7 @@ def normalize_artist_name(raw_artist: str) -> str:
     for pattern, replacement in artist_rules.items():
         raw_artist = re.sub(pattern, replacement, raw_artist)
     cleaned = raw_artist.strip().lower()
-    return ARTIST_NAME_OVERRIDES.get(cleaned, raw_artist.strip())
+    return ARTIST_OVERRIDES(cleaned, raw_artist.strip())
 
 
 def scan_library_for_artists(library_dir: Path) -> dict:
@@ -47,13 +47,13 @@ def scan_library_for_artists(library_dir: Path) -> dict:
 
 def suggest_overrides(artist_dict: dict) -> dict:
     """
-    Schlägt neue Einträge für ARTIST_NAME_OVERRIDES vor, basierend auf Varianten.
+    Schlägt neue Einträge für ARTIST_OVERRIDES vor, basierend auf Varianten.
     """
     suggestions = {}
     for normalized, variants in artist_dict.items():
         for variant in variants:
             variant_key = variant.strip().lower()
-            if variant_key not in ARTIST_NAME_OVERRIDES or ARTIST_NAME_OVERRIDES[variant_key] != normalized:
+            if variant_key not in ARTIST_OVERRIDES or ARTIST_OVERRIDES[variant_key] != normalized:
                 if variant.strip() != normalized and variant_key != normalized:
                     suggestions[variant_key] = normalized
     return suggestions
@@ -89,7 +89,7 @@ async def handle_check_artists(update: Update, context: ContextTypes.DEFAULT_TYP
             output_lines.append(f"• <code>{escaped_norm}</code>: {escaped_variant}")
 
     if suggestions:
-        output_lines.append("\n<b>🧠 Mapping-Vorschläge (für ARTIST_NAME_OVERRIDES):</b>")
+        output_lines.append("\n<b>🧠 Mapping-Vorschläge (für ARTIST_OVERRIDES):</b>")
         for raw, norm in sorted(suggestions.items(), key=lambda item: item[0]):
             # Maskiere auch hier die Rohtexte und normalisierten Texte
             escaped_raw = escape_html(raw)

@@ -33,7 +33,7 @@ from klassen.clean_artist import CleanArtist
 from klassen.cover_fixer import CoverFixer  # Neuer Import
 from services.organizer import MusicOrganizer
 from cookie_handler import CookieHandler
-from helfer.artist_map import artist_rules, ARTIST_NAME_OVERRIDES
+from klassen.artist_map import ARTIST_RULES, ARTIST_OVERRIDES
 
 # Import der benötigten Funktionen aus MetadataManager
 escape_markdown_v2 = MetadataManager.escape_markdown_v2

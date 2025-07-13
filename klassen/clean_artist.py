@@ -10,7 +10,7 @@ class CleanArtist:
         self.overrides = ARTIST_OVERRIDES
 
     def clean(self, name: str) -> str:
-        """Bereinigt und normalisiert einen Künstlernamen anhand definierter Regeln und Overrides."""
+        """Bereinigt und normalisiert einen K篓鹿nstlernamen anhand definierter Regeln und Overrides."""
         original = name
         name = name.strip().lower()
 
@@ -24,5 +24,5 @@ class CleanArtist:
 
         cleaned = name.strip().title()
 
-        log_debug(f"🎨 Artist-Bereinigung: '{original}' → '{cleaned}'")
+        log_debug(f"鈥�9脌6 Artist-Bereinigung: '{original}' 隆煤 '{cleaned}'")
         return cleaned

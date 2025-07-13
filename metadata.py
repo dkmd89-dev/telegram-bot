@@ -8,7 +8,7 @@ from config import Config
 from klassen.title_cleaner import TitleCleaner
 from klassen.clean_artist import CleanArtist
 from fixes.metadata_fallbacks import fix_metadata_fallbacks
-from helfer.artist_map import artist_rules, ARTIST_NAME_OVERRIDES
+from klassen.artist_map import ARTIST_RULES, ARTIST_OVERRIDES
 from utils import sanitize_filename, identify_album_from_video, safe_rename
 from logger import log_error, log_debug, log_warning, log_info
 from klassen.musicbrainz_client import MusicBrainzClient
@@ -18,7 +18,7 @@ from klassen.cover_fixer import CoverFixer
 from helfer.lastfm_helpers import pick_best_genre
 
 # Initialisierungen
-artist_cleaner = CleanArtist(artist_rules=artist_rules, artist_overrides=ARTIST_NAME_OVERRIDES)
+artist_cleaner = CleanArtist()  # Keine Parameter nötig!e
 musicbrainz_client = MusicBrainzClient(artist_cleaner)
 genius_client = GeniusClient(artist_cleaner)
 lastfm_client = LastFMClient()

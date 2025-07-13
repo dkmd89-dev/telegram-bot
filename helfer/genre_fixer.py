@@ -2,52 +2,66 @@
 
 import logging
 from typing import Optional
-from klassen.artist_map import ARTIST_GENRE_OVERRIDES
+from klassen.artist_map import ARTIST_GENRE_OVERRIDES, ARTIST_RULES, ARTIST_OVERRIDES
 from klassen.clean_artist import CleanArtist
 
+# Setup: Dateibasiertes Logging (optional)
+from logging.handlers import RotatingFileHandler
+
 logger = logging.getLogger("GenreFetcher")
+logger.setLevel(logging.INFO)
+
+# Optional: Dateilog mit Rotation
+if not logger.handlers:
+    file_handler = RotatingFileHandler("logs/genre_fixer.log", maxBytes=100_000, backupCount=3)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
 class GenreFetcher:
-    """Bestimmt das Genre basierend auf Titel und K¨¹nstler, mit Logging und Fallback auf Artist-Map."""
+    """Bestimmt das Genre basierend auf Titel und KÃ¼nstler, mit Logging und Fallback auf Artist-Map."""
 
     def __init__(self):
         self.artist_genre_map = ARTIST_GENRE_OVERRIDES
-        self.cleaner = CleanArtist()
+        self.cleaner = CleanArtist(artist_rules=ARTIST_RULES, artist_overrides=ARTIST_OVERRIDES)
 
     async def get_genre(self, title: str, artist: str) -> Optional[str]:
         clean_artist = self.cleaner.clean(artist).lower()
-        log_prefix = f"[{artist} ¨C {title}]"
+        log_prefix = f"[{artist} â€“ {title}]"
 
-        logger.debug(f"{log_prefix} ”9ä3 Starte Genre-Erkennung")
+        logger.debug(f"{log_prefix} ðŸ” Starte Genre-Erkennung")
 
         genre = await self.get_genre_from_musicbrainz(title, artist)
         if genre:
-            logger.info(f"{log_prefix} 7¼3 Genre ¨¹ber MusicBrainz: {genre}")
+            logger.info(f"{log_prefix} âœ… Genre Ã¼ber MusicBrainz: {genre}")
             return genre
 
         genre = await self.get_genre_from_genius(title, artist)
         if genre:
-            logger.info(f"{log_prefix} 7¼3 Genre ¨¹ber Genius: {genre}")
+            logger.info(f"{log_prefix} âœ… Genre Ã¼ber Genius: {genre}")
             return genre
 
         genre = await self.get_genre_from_lastfm(title, artist)
         if genre:
-            logger.info(f"{log_prefix} 7¼3 Genre ¨¹ber Last.fm: {genre}")
+            logger.info(f"{log_prefix} âœ… Genre Ã¼ber Last.fm: {genre}")
             return genre
 
         genre = self.artist_genre_map.get(clean_artist)
         if genre:
-            logger.info(f"{log_prefix} 6À7„1‚5 Fallback-Genre ¨¹ber Artist-Zuordnung: {genre}")
+            logger.info(f"{log_prefix} â„¹ï¸ Fallback-Genre Ã¼ber Artist-Zuordnung: {genre}")
         else:
-            logger.warning(f"{log_prefix} 7Ã4 Kein Genre erkennbar")
+            logger.warning(f"{log_prefix} âŒ Kein Genre erkennbar")
 
         return genre
 
     async def get_genre_from_musicbrainz(self, title: str, artist: str) -> Optional[str]:
+        # MusicBrainz-API-Integration hier einbauen
         return None
 
     async def get_genre_from_genius(self, title: str, artist: str) -> Optional[str]:
+        # Genius-API-Integration hier einbauen
         return None
 
     async def get_genre_from_lastfm(self, title: str, artist: str) -> Optional[str]:
+        # Last.fm-API-Integration hier einbauen
         return None

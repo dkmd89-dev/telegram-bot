@@ -40,7 +40,7 @@ from mutagen import MutagenError
 # Lokale Module
 from config import Config
 from logger import log_error
-from helfer.artist_map import ARTIST_GENRE_MAP
+from klassen.artist_map import GENRE_MAP
 
 # Logger konfigurieren - Verbesserungsvorschlag #10
 logger = logging.getLogger(__name__)

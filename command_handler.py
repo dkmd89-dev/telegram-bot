@@ -47,7 +47,7 @@ from config import Config
 from services.downloader import YoutubeDownloader
 from handlers.message_handler import handle_message
 from helfer.markdown_helfer import escape_md_v2
-from helfer.artist_map import artist_rules, ARTIST_NAME_OVERRIDES
+from klassen.artist_map import ARTIST_RULES, ARTIST_OVERRIDES
 from emoji import EMOJI
 from klassen.navidrome_stats import NavidromeStats
 from klassen.stats_handler import StatsHandler

@@ -14,7 +14,7 @@ from klassen.lastfm_client import LastFMClient
 from klassen.clean_artist import CleanArtist
 from klassen.title_cleaner import TitleCleaner
 from klassen.youtube_client import YouTubeClient
-from helfer.artist_map import artist_rules, ARTIST_NAME_OVERRIDES
+from klassen.artist_map import ARTIST_RULES, ARTIST_OVERRIDES
 
 async def handle_fixcovers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_target = update.callback_query.message if update.callback_query else update.message
@@ -26,7 +26,7 @@ async def handle_fixcovers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         # Clients initialisieren
-        artist_cleaner = CleanArtist(artist_rules=artist_rules, artist_overrides=ARTIST_NAME_OVERRIDES)
+        artist_cleaner = CleanArtist()  # Keine Parameter nötig!
         musicbrainz_client = MusicBrainzClient(artist_cleaner)
         genius_client = GeniusClient(artist_cleaner)
         lastfm_client = LastFMClient()
